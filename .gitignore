@@ -9,3 +9,5 @@
 
 # Do not ignore the .gitignore file itself
 !.gitignore
+
+!*.md
