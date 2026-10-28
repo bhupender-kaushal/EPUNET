@@ -122,21 +122,16 @@ class HierarchicalCore(nn.Module):
         curr_dec_channels = rev_channels[0]
         
         for i, latent_dim in enumerate(latent_dims):
-            self.dist_convs.append(nn.Conv2d(curr_dec_channels, 2 * latent_dim, kernel_size=1))
+            dist_layer = nn.Conv2d(curr_dec_channels, 2 * latent_dim, kernel_size=1)
+            # F2: VAE zero-head initialisation (prior = posterior = N(0, 1) at the start)
+            torch.nn.init.zeros_(dist_layer.weight)
+            torch.nn.init.zeros_(dist_layer.bias)
+            self.dist_convs.append(dist_layer)
             next_skip_channels = rev_channels[i + 1]
             in_ch = curr_dec_channels + latent_dim + next_skip_channels
             out_ch = rev_channels[i + 1]
             self.decoder_blocks.append(nn.Sequential(*[ResBlock(in_ch if j==0 else out_ch, out_ch) for j in range(3)]))
             curr_dec_channels = out_ch
-
-        for i, latent_dim in enumerate(latent_dims):
-            dist_layer = nn.Conv2d(curr_dec_channels, 2 * latent_dim, kernel_size=1)
-            
-            # VAE Zero-Head Initialization
-            torch.nn.init.zeros_(dist_layer.weight)
-            torch.nn.init.zeros_(dist_layer.bias)
-            
-            self.dist_convs.append(dist_layer)
 
     def forward(self, inputs, use_mean=False, z_q=None):
         encoder_features = inputs
@@ -326,19 +321,24 @@ class HierarchicalEvidentialUNet(nn.Module):
     #     return loss, mean_data_loss, (masked_kl_edl + masked_au_edl), vae_kl_loss
 
 
-    def forward_train_step(self, image, mask_one_hot, mask_labels, lambda_geco, kappa, n_samples=3):
-        prior_out = self.prior(image, use_mean=False)
-        posterior_in = torch.cat([mask_one_hot, image], dim=1)
+    def forward_train_step(self, image, mask_one_hot, mask_labels, lambda_geco, kappa, n_samples=3, edl_kl_weight=1.0):
+        posterior_in  = torch.cat([mask_one_hot, image], dim=1)
         posterior_out = self.posterior(posterior_in, use_mean=False)
-        
-        vae_kl_loss = self.calculate_hierarchical_kl(prior_out['distributions'], posterior_out['distributions'])
-        
+        z_post        = posterior_out['used_latents']                      # one consistent top-down sample
+        # F1: evaluate every prior level along the posterior's sampled path, p(z_i | z_<i (posterior), x)
+        prior_cond    = self.prior(image, z_q=z_post)
+        vae_kl_loss   = self.calculate_hierarchical_kl(prior_cond['distributions'],
+                                                       posterior_out['distributions'])
+
         total_masked_data_loss = 0.0
-        
+
         # 1. PASS 1: STOCHASTIC (Focus purely on Boundary Variance)
-        for _ in range(n_samples):
-            z_sample = [dist.rsample() for dist in posterior_out['distributions']]
-            prior_z_out = self.prior(image, z_q=z_sample)
+        for k in range(n_samples):
+            if k == 0:
+                prior_z_out = prior_cond                                   # reuse: already decoded with z_post
+            else:
+                z_k = self.posterior(posterior_in, use_mean=False)['used_latents']
+                prior_z_out = self.prior(image, z_q=z_k)
             logits_stoch = self.f_comb(prior_z_out['encoder_features'], prior_z_out['decoder_features'])
             
             L_ace_map, L_e_dice_stoch, _, _ = unreduced_evidential_loss(logits_stoch, mask_labels, c=self.num_classes)
@@ -355,10 +355,13 @@ class HierarchicalEvidentialUNet(nn.Module):
         mean_data_loss = total_masked_data_loss / n_samples
         
         # 2. PASS 2: DETERMINISTIC (Unbreakable Structural Anchor)
-        z_mean = [dist.mean for dist in posterior_out['distributions']]
+        # F1: a chain of posterior MEANS (each level conditioned on the previous level's mean)
+        z_mean = self.posterior(posterior_in, use_mean=True)['used_latents']
         prior_z_mean_out = self.prior(image, z_q=z_mean)
         logits_det = self.f_comb(prior_z_mean_out['encoder_features'], prior_z_mean_out['decoder_features'])
-        
+
+        # TODO(phase2): F4 - the EDL KL / AU terms use the one-hot label of ONE random grader, which
+        # penalises evidence for the other graders' answer where they disagree (measured by E5/E7).
         L_ace_map_det, L_e_dice_det, L_KL_map, L_AU_map = unreduced_evidential_loss(logits_det, mask_labels, c=self.num_classes)
         
         # NEW: GLOBAL ACE for the deterministic mean. 
@@ -382,8 +385,12 @@ class HierarchicalEvidentialUNet(nn.Module):
         hinge_kl_loss = torch.max(vae_kl_loss, min_kl_nats)
 
         # Use hinge_kl_loss in the final optimizer calculation
-        loss = constraint_loss + masked_kl_edl + masked_au_edl + hinge_kl_loss + structural_anchor_loss
-        
+        # F3: EDL Dirichlet KL annealed by the caller (Sensoy et al. 2018: min(1, t/10))
+        loss = constraint_loss + edl_kl_weight * masked_kl_edl + masked_au_edl + hinge_kl_loss + structural_anchor_loss
+
         # loss = constraint_loss + masked_kl_edl + masked_au_edl + vae_kl_loss + structural_anchor_loss
-        
+
+        # Separate loss parts for per-epoch logging (F5.6)
+        self.last_loss_parts = {'edl_kl': masked_kl_edl.detach(), 'au': masked_au_edl.detach()}
+
         return loss, mean_data_loss, (masked_kl_edl + masked_au_edl), vae_kl_loss, L_e_dice_det

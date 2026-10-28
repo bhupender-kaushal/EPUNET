@@ -7,7 +7,7 @@ import random
 import pickle
 import os
 from glob import glob
-import matplotlib
+import matplotlib.image  # explicit: matplotlib.image is not loaded by "import matplotlib"
 
 
 class LIDC_IDRI(Dataset):
@@ -73,17 +73,27 @@ class LIDC_IDRI(Dataset):
         return len(self.images)
 
 class LIDC_IDRI_Folder(Dataset):
-    def __init__(self, dataset_location, mode='train', transform=None):
+    def __init__(self, dataset_location, mode='train', transform=None, allow_missing_gt=False):
         self.dataset_location = dataset_location
         self.mode = mode.lower()
         self.transform = transform
-        
+
         # 1. Find all image files across ALL patient folders
         # This makes the dataset recognize every individual slice
         self.all_image_paths = sorted(glob(os.path.join(dataset_location, 'images', '*', '*.png')))
-        
+
         if not self.all_image_paths:
             raise RuntimeError(f"No .png images found in {dataset_location}/images")
+
+        # F6: a wrong path would silently turn every label into an empty mask
+        num_missing = sum(
+            1 for p in self.all_image_paths
+            if not all(os.path.exists(p.replace('images', 'gt').replace('.png', f'_l{l}.png')) for l in range(4))
+        )
+        print(f"[*] {dataset_location}: {len(self.all_image_paths)} images, {num_missing} with missing GT files")
+        if num_missing > 0 and not allow_missing_gt:
+            raise RuntimeError(f"{num_missing} images in {dataset_location} have missing gt/..._l{{0..3}}.png files "
+                               f"(pass allow_missing_gt=True to fill them with empty masks)")
 
     def __len__(self):
         # Now returns the total count of images/slices

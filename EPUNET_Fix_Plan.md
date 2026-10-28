@@ -87,6 +87,15 @@ After the loop (`from sklearn.metrics import roc_auc_score`), compute and write 
 
 **Why:** this decides whether the epistemic half of the paper holds. A mean u ≈ 0.7 with no separation would mean the evidential head is not informative.
 
+### E7. Make the uncertainty check discriminative (added after the first full Step A run)
+The first run gave AUROC(u, err) = 0.948, but three things make it uninformative: the error rate is 0.67%, so easy background dominates the AUROC; mean u is 0.0000 on correct and 0.0003 on wrong pixels; and u and the aleatoric spread correlate with disagreement almost identically. Add:
+1. **Region-of-interest AUROC:** report AUROC(u, err) and AUROC(alea, err) also on the pixels inside a 5-px dilation of (union of the 4 GTs ∪ mean prediction). This removes the trivial background.
+2. **Standard baselines on the same pixels:** AUROC of predictive entropy H(p̄) and of 1 − max(p̄) of the mean sample probability. The evidential u must beat these, otherwise it adds nothing.
+3. **Is u just aleatoric spread?** Report `Spearman(u, alea)` on the region of interest.
+4. **Evidence saturation:** report the median and 99th percentile of the total evidence S over all pixels, and over wrong pixels. Mean u ≈ 3e-4 on wrong pixels means S ≈ 6000, i.e. extremely confident even when wrong.
+5. **ECE on the region of interest only** (the global value is dominated by background).
+6. **Shift test (cheap OOD proxy):** re-run the same metrics on the test set with additive Gaussian noise (σ = 0.05, 0.1) and with contrast scaling (×0.7). Report mean u and mean alea on the region of interest per condition. Epistemic u should rise with shift; this is the property the paper claims.
+
 ### E6. Loading the old checkpoint after Step B (helper)
 Bug F2 removes 4 unused `dist_convs` layers, so old checkpoints will contain extra keys. Add to `load_best_checkpoint`:
 ```python

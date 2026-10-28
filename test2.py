@@ -8,6 +8,12 @@ import glob
 from torch.utils.data import DataLoader
 import random
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import spearmanr
+from scipy.ndimage import binary_dilation
+from sklearn.metrics import roc_auc_score
+
+# Fixed binarisation threshold (E3): never tuned on the test set.
+THRESHOLD = 0.5
 
 # Replace with your actual imports
 from load_LIDC_data import LIDC_IDRI_Folder
@@ -57,22 +63,150 @@ def kohl_iou(pred, gt):
     union = np.logical_or(pred_b, gt_b).sum()
     return intersection / union
 
+def iou_rec_pair(pred, gt):
+    """IoU for posterior reconstruction: correctly predicted absences are excluded (NaN)."""
+    p, g = pred.astype(bool), gt.astype(bool)
+    if p.sum() == 0 and g.sum() == 0:
+        return np.nan                     # correctly predicted absence -> excluded
+    if p.sum() == 0 or g.sum() == 0:
+        return 0.0                        # wrongly predicted absence -> penalised
+    return np.logical_and(p, g).sum() / np.logical_or(p, g).sum()
+
+def expected_calibration_error(p, y, n_bins=15):
+    """ECE of foreground probabilities p against binary labels y, equal-width bins."""
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(p, bins[1:-1]), 0, n_bins - 1)
+    ece = 0.0
+    for b in range(n_bins):
+        sel = idx == b
+        if sel.any():
+            ece += sel.mean() * abs(y[sel].mean() - p[sel].mean())
+    return float(ece)
+
+UNC_KEYS = ('u', 'alea', 'err', 'p', 'y', 'disagree', 'S', 'roi')
+
+def new_unc_store():
+    return {k: [] for k in UNC_KEYS}
+
+def collect_uncertainty(unc_store, sample_probs, sample_S, gt_list, threshold, roi_dilation=5):
+    """E5/E7: append flattened per-pixel uncertainty, error and ROI arrays for one lesion slice."""
+    mean_prob_map = np.mean(sample_probs, axis=0)
+    mean_recon = (mean_prob_map > threshold).astype(np.uint8)
+    consensus = (np.sum(gt_list, axis=0) >= 2).astype(np.uint8)
+    grader_frac = np.mean(gt_list, axis=0)                         # 0, .25, .5, .75, 1
+    error = (mean_recon != consensus).astype(np.uint8)
+    aleatoric = np.std(np.stack(sample_probs), axis=0)             # spread across latent samples
+    S_stack = np.stack(sample_S)
+    # E7.1: region of interest = 5-px (square) dilation of (union of the GTs + mean prediction)
+    roi = binary_dilation((np.max(gt_list, axis=0) > 0) | (mean_recon > 0),
+                          structure=np.ones((3, 3), dtype=bool), iterations=roi_dilation)
+    unc_store['u'].append(np.mean(2.0 / S_stack, axis=0).ravel().astype(np.float32))
+    unc_store['alea'].append(aleatoric.ravel().astype(np.float32))
+    unc_store['err'].append(error.ravel())
+    unc_store['p'].append(mean_prob_map.ravel().astype(np.float32))
+    unc_store['y'].append(consensus.ravel())
+    unc_store['disagree'].append((grader_frac * (1 - grader_frac)).ravel().astype(np.float32))  # 0 when graders agree
+    unc_store['S'].append(np.mean(S_stack, axis=0).ravel().astype(np.float32))
+    unc_store['roi'].append(roi.ravel())
+
+def _auroc(labels, scores):
+    return roc_auc_score(labels, scores) if 0 < labels.sum() < labels.size else float('nan')
+
+def summarize_uncertainty(unc_store):
+    """Returns the E5 + E7 uncertainty report lines for the collected pixels."""
+    if not unc_store['u']:
+        return ["No lesion slices evaluated.\n"]
+    d = {k: np.concatenate(unc_store[k]) for k in UNC_KEYS}
+    u, alea, err, p, y, disagree, S, roi = (d[k] for k in UNC_KEYS)
+    p64 = np.clip(p.astype(np.float64), 1e-12, 1 - 1e-12)
+    entropy = -(p64 * np.log(p64) + (1 - p64) * np.log(1 - p64))   # predictive entropy of p_bar
+    one_minus_max = 1.0 - np.maximum(p, 1 - p)
+    wrong = err == 1
+    nan = float('nan')
+    lines = [
+        f"Pixels / error rate: {u.size} / {err.mean():.4f}\n",
+        f"AUROC(u, err):       {_auroc(err, u):.4f}\n",
+        f"AUROC(alea, err):    {_auroc(err, alea):.4f}\n",
+        f"Mean u correct/wrong:{u[~wrong].mean():.4f} / {u[wrong].mean() if wrong.any() else nan:.4f}\n",
+        f"ECE(p, y), 15 bins:  {expected_calibration_error(p, y, n_bins=15):.4f}\n",
+        f"Spearman(u, disagree):    {spearmanr(u, disagree).correlation:.4f}\n",
+        f"Spearman(alea, disagree): {spearmanr(alea, disagree).correlation:.4f}\n",
+        "--- E7: region of interest (5-px dilation of GT union + prediction) ---\n",
+    ]
+    e, r = err[roi], roi
+    lines += [
+        f"ROI pixels / error rate:  {int(r.sum())} / {e.mean():.4f}\n",
+        f"ROI AUROC(u, err):        {_auroc(e, u[r]):.4f}\n",
+        f"ROI AUROC(alea, err):     {_auroc(e, alea[r]):.4f}\n",
+        f"ROI AUROC(entropy, err):  {_auroc(e, entropy[r]):.4f}   (baseline)\n",
+        f"ROI AUROC(1-max p, err):  {_auroc(e, one_minus_max[r]):.4f}   (baseline)\n",
+        f"ROI mean u / alea:        {u[r].mean():.6f} / {alea[r].mean():.6f}\n",
+        f"ROI Spearman(u, alea):    {spearmanr(u[r], alea[r]).correlation:.4f}\n",
+        f"ROI ECE(p, y), 15 bins:   {expected_calibration_error(p[r], y[r], n_bins=15):.4f}\n",
+        "--- E7: evidence saturation (total evidence S, mean over samples) ---\n",
+        f"S median / p99 (all):     {np.median(S):.1f} / {np.percentile(S, 99):.1f}\n",
+        f"S median / p99 (wrong):   " + (f"{np.median(S[wrong]):.1f} / {np.percentile(S[wrong], 99):.1f}\n" if wrong.any() else "nan / nan\n"),
+    ]
+    return lines
+
+def apply_shift(patch, kind, value, generator):
+    """E7.6: cheap distribution shifts of the input patch."""
+    if kind == "noise":
+        return patch + value * torch.randn(patch.shape, generator=generator).to(patch.device)
+    if kind == "contrast":
+        mean = patch.mean(dim=(2, 3), keepdim=True)
+        return mean + value * (patch - mean)
+    return patch
+
+def shift_test(net, test_loader, device, output_dir, N_samples=16, threshold=THRESHOLD,
+               conditions=(("clean", None, 0.0), ("noise", "noise", 0.05), ("noise", "noise", 0.1), ("contrast", "contrast", 0.7))):
+    """E7.6: does epistemic u rise under input shift? Reports u / alea on the ROI per condition."""
+    net.eval()
+    stores = {f"{name} {value}": new_unc_store() for name, _, value in conditions}
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for patch_orig, masks_orig, meta in test_loader:
+            if masks_orig.shape[1] != 4: continue
+            gt_list = [masks_orig[0, j].cpu().numpy() for j in range(4)]
+            if sum(1 for gt in gt_list if gt.sum() > 0) == 0: continue
+            for name, kind, value in conditions:
+                patch = apply_shift(patch_orig, kind, value, generator).to(device)
+                sample_probs, sample_S = [], []
+                for _ in range(N_samples):
+                    alpha = F.softplus(net.sample(patch, use_mean=False)) + 1.0
+                    S = torch.sum(alpha, dim=1, keepdim=True)
+                    sample_probs.append((alpha / S)[0, 1].cpu().numpy())
+                    sample_S.append(S[0, 0].cpu().numpy())
+                collect_uncertainty(stores[f"{name} {value}"], sample_probs, sample_S, gt_list, threshold)
+
+    path = os.path.join(output_dir, "shift_test_summary.txt")
+    with open(path, "w") as f:
+        f.write("=== E7.6 SHIFT TEST (lesion slices; noise sigma is absolute, contrast scales around the patch mean) ===\n")
+        f.write(f"{'condition':<16} | {'ROI mean u':<12} | {'ROI mean alea':<13} | {'ROI AUROC(u,err)':<16} | {'ROI err rate':<12}\n")
+        for key, store in stores.items():
+            u, alea = np.concatenate(store['u']), np.concatenate(store['alea'])
+            err, roi = np.concatenate(store['err']), np.concatenate(store['roi'])
+            f.write(f"{key:<16} | {u[roi].mean():<12.6f} | {alea[roi].mean():<13.6f} | "
+                    f"{_auroc(err[roi], u[roi]):<16.4f} | {err[roi].mean():<12.4f}\n")
+    print(f"[*] Shift test complete. Summary saved to {path}")
+
 def hungarian_matched_iou(samples, gts):
-    """Uses the Hungarian Algorithm to find optimal sample-to-GT assignments."""
+    """Uses the Hungarian Algorithm to find optimal sample-to-GT assignments.
+
+    Both sets are duplicated to their LCM (Kohl et al. 2019) so that every sample
+    is matched; a rectangular M x N matrix would only score the best M samples.
+    """
     M = len(gts)
     N = len(samples)
     if M == 0 or N == 0: return 0.0
-        
-    # Cost matrix: M x N. 
+
+    L = int(np.lcm(M, N))                             # 16 for 4 GTs x 16 samples
+    gts_rep     = [gts[i % M] for i in range(L)]
+    samples_rep = [samples[j % N] for j in range(L)]
     # Negate the IoU because linear_sum_assignment minimizes the cost.
-    cost_matrix = np.zeros((M, N))
-    for i in range(M):
-        for j in range(N):
-            cost_matrix[i, j] = -kohl_iou(samples[j], gts[i])
-            
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
-    matched_ious = [-cost_matrix[row, col] for row, col in zip(row_ind, col_ind)]
-    return np.mean(matched_ious)
+    cost = -np.array([[kohl_iou(s, g) for s in samples_rep] for g in gts_rep])
+    r, c = linear_sum_assignment(cost)
+    return float(-cost[r, c].mean())
 
 def get_patient_slice_id(meta, fallback_id=0):
     try:
@@ -90,13 +224,15 @@ def get_patient_slice_id(meta, fallback_id=0):
 
 # --- GLOBAL EVALUATION & BEST SLICE TRACKING ---
 
-def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, threshold=0.505):
+def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, threshold=THRESHOLD):
     net.eval()
     
     # Trackers for the two distinct evaluation constraints
     metrics_all = {'ged': [], 'dice': [], 'iou_rec': [], 'h_iou': []}
     metrics_4gt = {'ged': [], 'dice': [], 'iou_rec': [], 'h_iou': []}
-    
+    # E5/E7: flattened pixel arrays (lesion slices only) for the uncertainty sanity check
+    unc_store = new_unc_store()
+
     detailed_stats_path = os.path.join(output_dir, "per_patient_detailed_stats.txt")
     summary_stats_path = os.path.join(output_dir, "global_summary.txt")
     top_k_slices = []
@@ -138,14 +274,15 @@ def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, th
                 
                 posterior_recons.append(pred_binary_rec)
                 
-                # Calculate metric using Kohl's rule
-                slice_iou_rec_list.append(kohl_iou(pred_binary_rec, gt_list[i]))
-                
-            avg_slice_iou_rec = np.mean(slice_iou_rec_list)
+                # Correct absences are NaN and excluded from the mean (E2)
+                slice_iou_rec_list.append(iou_rec_pair(pred_binary_rec, gt_list[i]))
+
+            avg_slice_iou_rec = np.nan if np.all(np.isnan(slice_iou_rec_list)) else np.nanmean(slice_iou_rec_list)
 
             # --- 2. PRIOR PREDICTION (Monte Carlo Integration) ---
             sample_probs = []
             sample_epistemics = []
+            sample_S = []
             
             for _ in range(N_samples):
                 logits_stoch = net.sample(patch, use_mean=False) 
@@ -157,6 +294,7 @@ def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, th
                 
                 sample_probs.append(prob)
                 sample_epistemics.append(epistemic)
+                sample_S.append(S_stoch[0, 0].cpu().numpy())
             
             mean_prob_map = np.mean(sample_probs, axis=0)
             mean_recon = (mean_prob_map > threshold).astype(float)
@@ -175,7 +313,11 @@ def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, th
             else:
                 # If no annotator found a tumor, and the model predicted empty, DICE is mathematically 1.0
                 dice_score = 1.0 if mean_recon.sum() == 0 else 0.0
-            
+
+            # E5/E7: per-pixel uncertainty vs. error / grader disagreement (lesion slices only)
+            if num_tumor_gts > 0:
+                collect_uncertainty(unc_store, sample_probs, sample_S, gt_list, threshold)
+
             # --- 4. RECORDING DATA ---
             # Append to Full Dataset metrics
             metrics_all['ged'].append(ged_score)
@@ -215,18 +357,23 @@ def evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16, th
         f.write(f"Total Slices Evaluated: {len(metrics_all['ged'])}\n")
         f.write(f"Avg GED:             {np.mean(metrics_all['ged']):.4f}\n")
         f.write(f"Avg Consensus DICE:  {np.mean(metrics_all['dice']):.4f}\n")
-        f.write(f"Avg IoU_rec:         {np.mean(metrics_all['iou_rec']):.4f}\n")
+        f.write(f"Avg IoU_rec:         {np.nanmean(metrics_all['iou_rec']):.4f}  (NaN-mean, {int(np.sum(~np.isnan(metrics_all['iou_rec'])))} slices)\n")
         f.write(f"Avg Hungarian IoU:   {np.mean(metrics_all['h_iou']):.4f}\n\n")
         
         f.write("=== STRICT 4-ANNOTATOR PERFORMANCE ===\n")
         f.write(f"Total Slices Evaluated: {len(metrics_4gt['ged'])}\n")
         f.write(f"Avg GED:             {np.mean(metrics_4gt['ged']):.4f}\n")
         f.write(f"Avg Consensus DICE:  {np.mean(metrics_4gt['dice']):.4f}\n")
-        f.write(f"Avg IoU_rec:         {np.mean(metrics_4gt['iou_rec']):.4f}\n")
-        f.write(f"Avg Hungarian IoU:   {np.mean(metrics_4gt['h_iou']):.4f}\n")
-        
+        f.write(f"Avg IoU_rec:         {np.nanmean(metrics_4gt['iou_rec']):.4f}  (NaN-mean, {int(np.sum(~np.isnan(metrics_4gt['iou_rec'])))} slices)\n")
+        f.write(f"Avg Hungarian IoU:   {np.mean(metrics_4gt['h_iou']):.4f}\n\n")
+
+        f.write("=== UNCERTAINTY SANITY CHECK (lesion slices, pixel level) ===\n")
+        f.write(f"Checkpoint:          {getattr(net, 'loaded_checkpoint_info', 'unknown')}\n")
+        f.write(f"Threshold:           {threshold}\n")
+        f.writelines(summarize_uncertainty(unc_store))
+
     print(f"\n[*] Full evaluation complete. Summary saved to {summary_stats_path}")
-    return np.mean(metrics_all['ged']), np.mean(metrics_all['dice']), np.mean(metrics_all['iou_rec']), top_k_slices
+    return np.mean(metrics_all['ged']), np.mean(metrics_all['dice']), np.nanmean(metrics_all['iou_rec']), top_k_slices
 
 def plot_top_5_slices(top_slices, output_dir):
     if not top_slices: return
@@ -276,7 +423,7 @@ def plot_top_5_slices(top_slices, output_dir):
 
 # --- VISUALIZATION FUNCTIONS ---
 
-def analyze_multiple_patients_performance(net, test_loader, device, output_dir, num_patients=5, N_samples=8, threshold=0.505):
+def analyze_multiple_patients_performance(net, test_loader, device, output_dir, num_patients=5, N_samples=8, threshold=THRESHOLD):
     net.eval()
     data_iter = iter(test_loader)
     all_results = []
@@ -336,7 +483,7 @@ def analyze_multiple_patients_performance(net, test_loader, device, output_dir, 
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-def analyze_single_patient_ood(net, test_loader, device, output_dir, N_samples=8, threshold=0.505):
+def analyze_single_patient_ood(net, test_loader, device, output_dir, N_samples=8, threshold=THRESHOLD):
     net.eval()
     data_iter = iter(test_loader)
     while True:
@@ -403,20 +550,36 @@ def analyze_single_patient_ood(net, test_loader, device, output_dir, N_samples=8
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-def load_best_checkpoint(net, checkpoint_dir, device="cpu"):
-    best_file = os.path.join(checkpoint_dir, "model_latest.pth")
-    if not os.path.exists(best_file): raise FileNotFoundError(f"Cannot find model_best.pth in {checkpoint_dir}")
-    state_dict = torch.load(best_file, map_location=device)
-    if 'model_state_dict' in state_dict: net.load_state_dict(state_dict['model_state_dict'])
-    elif 'state_dict' in state_dict: net.load_state_dict(state_dict['state_dict'])
-    else: net.load_state_dict(state_dict)
-    print(f"[*] Successfully loaded optimal weights from: {best_file}")
+def load_best_checkpoint(net, checkpoint_dir, device="cpu", which="best"):
+    # E4: explicitly choose model_best.pth (selected on val GED) or model_latest.pth (last epoch)
+    files = {"best": "model_best.pth", "latest": "model_latest.pth"}
+    if which not in files: raise ValueError(f"which must be one of {list(files)}, got {which!r}")
+    ckpt_file = os.path.join(checkpoint_dir, files[which])
+    if not os.path.exists(ckpt_file): raise FileNotFoundError(f"Cannot find {files[which]} in {checkpoint_dir}")
+    checkpoint = torch.load(ckpt_file, map_location=device)
+    if 'model_state_dict' in checkpoint: sd = checkpoint['model_state_dict']
+    elif 'state_dict' in checkpoint: sd = checkpoint['state_dict']
+    else: sd = checkpoint
+    # E6: drop keys the current model no longer has (dead dist_convs.4-7 removed by F2)
+    dropped = [k for k in sd if k not in net.state_dict()]
+    sd = {k: v for k, v in sd.items() if k in net.state_dict()}
+    net.load_state_dict(sd, strict=True)
+    epoch = checkpoint.get('epoch', 'unknown') if isinstance(checkpoint, dict) else 'unknown'
+    print(f"[*] Loaded '{which}' checkpoint: {ckpt_file} (epoch {epoch})")
+    if dropped: print(f"[*] Dropped {len(dropped)} unused keys: {dropped}")
+    net.loaded_checkpoint_info = f"{which} ({ckpt_file}, epoch {epoch})"
     return net
 
 if __name__ == "__main__":
 
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate a LIDC checkpoint")
+    parser.add_argument("--checkpoint_dir", type=str, default="outputs/42_checkpoint_20260422_131855")
+    parser.add_argument("--which", type=str, default="best", choices=["best", "latest"])
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint_dir = "outputs/42_checkpoint_20260422_131855" 
+    checkpoint_dir = args.checkpoint_dir
     run_name = os.path.basename(os.path.normpath(checkpoint_dir))
     output_dir = os.path.join("test_results_ood", run_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -437,7 +600,7 @@ if __name__ == "__main__":
     
     net = HierarchicalEvidentialUNet(input_channels=1, num_classes=2, latent_dims=[4,3,2,1], channels_per_block=[24, 48, 96, 192, 192, 192, 192, 192])
     net.to(device)
-    net = load_best_checkpoint(net, checkpoint_dir, device=device)
+    net = load_best_checkpoint(net, checkpoint_dir, device=device, which=args.which)
     
     final_ged, final_dice, final_iou_rec, top_5_slices = evaluate_full_dataset(net, test_loader, device, output_dir, N_samples=16)
     plot_top_5_slices(top_5_slices, output_dir)
@@ -445,3 +608,5 @@ if __name__ == "__main__":
     analyze_multiple_patients_performance(net, test_loader, device, output_dir, num_patients=5, N_samples=16) 
     print("\n[*] Running Dual Safety OOD Analysis...")
     analyze_single_patient_ood(net, test_loader, device, output_dir, N_samples=8)
+    print("\n[*] Running E7.6 shift test (clean / noise 0.05 / noise 0.1 / contrast x0.7)...")
+    shift_test(net, test_loader, device, output_dir, N_samples=16)
